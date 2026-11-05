@@ -1,0 +1,10 @@
+DOCPRAZO V3.1 - ALERTAS POR E-MAIL
+
+1. Faça uma cópia de seguranca da pasta data da sua versao anterior.
+2. Extraia este ZIP em uma pasta nova.
+3. Copie a pasta data antiga para DocPrazo_V3_1/data.
+4. Abra README_ATIVAR_EMAIL.md para conectar sua conta Resend.
+5. Reinicie com INICIAR_DOC_PRAZO.bat e acesse http://localhost:3005.
+
+NAO ENVIE SUAS CHAVES DE API PELO CHAT, POR PRINTS OU AO GITHUB.
+O envio real so funciona apos configurar a conta externa e testar.

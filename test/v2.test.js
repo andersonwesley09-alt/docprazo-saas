@@ -1,0 +1,77 @@
+'use strict';
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const os=require('node:os');
+const path=require('node:path');
+const temp=fs.mkdtempSync(path.join(os.tmpdir(),'docprazo-v2-'));
+process.env.DATA_DIR=temp;
+const {server,db}=require('../server');
+let root;
+async function req(url,{method='GET',session,csrf,body,raw=false}={}){
+ const response=await fetch(root+url,{method,headers:{...(session?{Cookie:session}:{}),...(csrf?{'X-CSRF-Token':csrf}:{}),...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
+ return {status:response.status,data:raw?Buffer.from(await response.arrayBuffer()):await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]||'',headers:response.headers};
+}
+const doc={title:'Alvará de Teste',category:'Alvará',reference:'000-12',responsible:'Ana',issue_date:'2026-01-01',expires_on:'2027-01-15',lead_days:90,notes:''};
+test('V2: equipe, permissões, anexos, auditoria, notificações e empresas isoladas',async()=>{
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));root=`http://127.0.0.1:${server.address().port}`;
+ try{
+  const a=await req('/api/signup',{method:'POST',body:{name:'Dona Ana',organization_name:'Loja A',email:'ana2@example.com',password:'Senhaforte12!'}});
+  const b=await req('/api/signup',{method:'POST',body:{name:'Dono B',organization_name:'Loja B',email:'bruno2@example.com',password:'Senhaforte12!'}});
+  assert.equal(a.status,201);assert.equal(b.status,201);
+  const ma=(await req('/api/me',{session:a.cookie})).data;
+  const mb=(await req('/api/me',{session:b.cookie})).data;
+  assert.equal(ma.user.role,'admin');
+  const created=await req('/api/documents',{method:'POST',session:a.cookie,csrf:ma.csrf,body:doc});
+  assert.equal(created.status,201);
+  const id=created.data.document.id;
+  const png=Buffer.from([137,80,78,71,13,10,26,10,0,0,0,0]);
+  const upload=await req(`/api/documents/${id}/attachments`,{method:'POST',session:a.cookie,csrf:ma.csrf,body:{name:'comprovante.png',content:png.toString('base64')}});
+  assert.equal(upload.status,201,JSON.stringify(upload.data));
+  const fid=upload.data.id;
+  assert.equal((await req(`/api/documents/${id}/attachments`,{session:a.cookie})).data.attachments.length,1);
+  assert.equal((await req('/api/documents',{session:a.cookie})).data.documents[0].attachment_count,1);
+  assert.equal((await req(`/api/attachments/${fid}/download`,{session:a.cookie,raw:true})).data.equals(png),true);
+  assert.equal((await req(`/api/attachments/${fid}/download`,{session:b.cookie})).status,404);
+  assert.equal((await req(`/api/documents/${id}/attachments`,{session:b.cookie})).status,404);
+  assert.equal((await req(`/api/attachments/${fid}/delete`,{method:'DELETE',session:b.cookie,csrf:mb.csrf})).status,404);
+  assert.equal((await req(`/api/documents/${id}/attachments`,{method:'POST',session:a.cookie,csrf:ma.csrf,body:{name:'fake.pdf',content:Buffer.from('<script>').toString('base64')}})).status,400);
+  const viewer=await req('/api/users',{method:'POST',session:a.cookie,csrf:ma.csrf,body:{name:'Leitor',email:'leitor@example.com',password:'Senha12345!',role:'viewer'}});
+  assert.equal(viewer.status,201);
+  const editor=await req('/api/users',{method:'POST',session:a.cookie,csrf:ma.csrf,body:{name:'Editor',email:'editor@example.com',password:'Senha12345!',role:'editor'}});
+  assert.equal(editor.status,201);
+  const vl=await req('/api/login',{method:'POST',body:{email:'leitor@example.com',password:'Senha12345!'}});
+  const ve=(await req('/api/me',{session:vl.cookie})).data;
+  assert.equal(ve.user.role,'viewer');
+  assert.equal((await req('/api/documents',{session:vl.cookie})).data.documents.length,1);
+  assert.equal((await req('/api/documents',{method:'POST',session:vl.cookie,csrf:ve.csrf,body:doc})).status,403);
+  assert.equal((await req(`/api/documents/${id}`,{method:'DELETE',session:vl.cookie,csrf:ve.csrf})).status,403);
+  assert.equal((await req(`/api/documents/${id}/attachments`,{method:'POST',session:vl.cookie,csrf:ve.csrf,body:{name:'comprovante.png',content:png.toString('base64')}})).status,403);
+  assert.equal((await req('/api/users',{session:vl.cookie})).status,403);
+  assert.equal((await req('/api/audit',{session:vl.cookie})).status,403);
+  assert.equal((await req('/api/notifications',{session:vl.cookie})).status,403);
+  const el=await req('/api/login',{method:'POST',body:{email:'editor@example.com',password:'Senha12345!'}});
+  const em=(await req('/api/me',{session:el.cookie})).data;
+  assert.equal((await req('/api/documents',{method:'POST',session:el.cookie,csrf:em.csrf,body:{...doc,title:'Outro documento'}})).status,201);
+  assert.equal((await req('/api/users',{session:el.cookie})).status,403);
+  assert.equal((await req('/api/organization',{method:'PATCH',session:el.cookie,csrf:em.csrf,body:{name:'Hacker'}})).status,403);
+  const audit=await req('/api/audit',{session:a.cookie});assert.equal(audit.status,200);assert.ok(audit.data.events.some(e=>e.event==='attachment.added'));
+  assert.equal((await req('/api/audit',{session:b.cookie})).data.events.length,0);
+  const opts=await req('/api/notifications',{session:a.cookie});assert.equal(opts.status,200);assert.equal(opts.data.provider_ready,false);
+  assert.equal((await req('/api/notifications',{method:'PATCH',session:a.cookie,csrf:ma.csrf,body:{email:'avisos@example.com',enabled:true}})).status,200);
+  assert.equal((await req('/api/notifications/send',{method:'POST',session:a.cookie,csrf:ma.csrf})).status,400);
+  const changed=await req('/api/organization',{method:'PATCH',session:a.cookie,csrf:ma.csrf,body:{name:'Loja A Nova'}});assert.equal(changed.status,200);
+  assert.equal((await req('/api/me',{session:a.cookie})).data.user.organization_name,'Loja A Nova');
+  const disable=await req(`/api/users/${viewer.data.user.id}`,{method:'DELETE',session:a.cookie,csrf:ma.csrf});assert.equal(disable.status,200);
+  assert.equal((await req('/api/me',{session:vl.cookie})).status,401);
+  const reenable=await req(`/api/users/${viewer.data.user.id}`,{method:'PATCH',session:a.cookie,csrf:ma.csrf,body:{role:'viewer',active:1}});assert.equal(reenable.status,200);
+  assert.equal((await req('/api/login',{method:'POST',body:{email:'leitor@example.com',password:'Senha12345!'}})).status,200);
+  assert.equal((await req('/api/me/password',{method:'POST',session:a.cookie,csrf:ma.csrf,body:{current_password:'errada',new_password:'NovaSenha123!'}})).status,403);
+  assert.equal((await req('/api/me/password',{method:'POST',session:a.cookie,csrf:ma.csrf,body:{current_password:'Senhaforte12!',new_password:'NovaSenha123!'}})).status,200);
+  assert.equal((await req('/api/login',{method:'POST',body:{email:'ana2@example.com',password:'NovaSenha123!'}})).status,200);
+  assert.equal((await req(`/api/attachments/${fid}/delete`,{method:'DELETE',session:a.cookie,csrf:ma.csrf})).status,200);
+  assert.equal((await req(`/api/attachments/${fid}/download`,{session:a.cookie})).status,404);
+ }finally{
+  await new Promise(r=>server.close(r));db.close();fs.rmSync(temp,{recursive:true,force:true});
+ }
+});
